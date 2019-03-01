@@ -4202,3 +4202,12 @@ not initialized on device side. It has internal linkage and is initialized by
 the initializer on host side.
   }];
 }
+
+def ClangRandstructDocs : Documentation {
+  let Category = DocCatVariable;
+  let Heading = "randomize_layout";
+  let Content = [{
+The attribute ``randomize_layout`` can be added to a record-type definition to select
+it for structure layout field randomization; a compile-time hardening technique.
+  }];
+}
