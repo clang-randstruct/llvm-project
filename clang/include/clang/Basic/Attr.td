@@ -3214,3 +3214,10 @@ def ObjCExternallyRetained : InheritableAttr {
   let Subjects = SubjectList<[NonParmVar, Function, Block, ObjCMethod]>;
   let Documentation = [ObjCExternallyRetainedDocs];
 }
+
+def RandomizeLayout : InheritableAttr {
+  let Spellings = [GCC<"randomize_layout">, Declspec<"randomize_layout">,
+    Keyword<"randomize_layout">];
+  let Subjects = SubjectList<[Record]>;
+  let Documentation = [ClangRandstructDocs];
+}
