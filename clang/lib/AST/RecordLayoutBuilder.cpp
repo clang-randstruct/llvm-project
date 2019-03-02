@@ -6,6 +6,7 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include "clang/AST/RandstructSeed.h"
 #include "clang/AST/RecordLayout.h"
 #include "clang/AST/ASTContext.h"
 #include "clang/AST/ASTDiagnostic.h"
@@ -15,6 +16,7 @@
 #include "clang/AST/DeclCXX.h"
 #include "clang/AST/DeclObjC.h"
 #include "clang/AST/Expr.h"
+#include "clang/AST/RecordFieldReorganizer.h"
 #include "clang/Basic/TargetInfo.h"
 #include "llvm/ADT/SmallSet.h"
 #include "llvm/Support/Format.h"
@@ -2983,6 +2985,24 @@ ASTContext::getASTRecordLayout(const RecordDecl *D) const {
   if (Entry) return *Entry;
 
   const ASTRecordLayout *NewEntry = nullptr;
+
+  bool ShouldBeRandomized = D->getAttr<RandomizeLayoutAttr>() != nullptr;
+  bool NotToBeRandomized = D->getAttr<NoRandomizeLayoutAttr>() != nullptr;
+  bool AutoSelectable = RandstructAutoSelect && Randstruct::isTriviallyRandomizable(D);
+
+  if (ShouldBeRandomized && NotToBeRandomized) {
+    getDiagnostics().Report(D->getLocation(), diag::warn_randomize_attr_conflict);
+  }
+
+  if (ShouldBeRandomized && D->isUnion()) {
+      getDiagnostics().Report(D->getLocation(), diag::warn_randomize_attr_union);
+      NotToBeRandomized = true;
+  }
+
+  if (!NotToBeRandomized && (ShouldBeRandomized || AutoSelectable)) {
+    Randstruct randstruct(RandstructSeed);
+    randstruct.reorganizeFields(*this,D);
+  }
 
   if (isMsLayout(*this)) {
     MicrosoftRecordLayoutBuilder Builder(*this);
