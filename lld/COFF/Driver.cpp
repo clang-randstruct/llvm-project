@@ -1000,6 +1000,8 @@ void LinkerDriver::link(ArrayRef<const char *> ArgsArr) {
   if (Args.hasArg(OPT_show_timing))
     Config->ShowTiming = true;
 
+  Config->ShowSummary = Args.hasArg(OPT_summary);
+
   ScopedTimer T(Timer::root());
   // Handle --version, which is an lld extension. This option is a bit odd
   // because it doesn't start with "/", but we deliberately chose "--" to
@@ -1080,6 +1082,9 @@ void LinkerDriver::link(ArrayRef<const char *> ArgsArr) {
     Config->Debug = true;
     Config->Incremental = true;
   }
+
+  // Handle /demangle
+  Config->Demangle = Args.hasFlag(OPT_demangle, OPT_demangle_no);
 
   // Handle /debugtype
   Config->DebugTypes = parseDebugTypes(Args);

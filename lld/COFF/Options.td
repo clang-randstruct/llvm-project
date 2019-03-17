@@ -154,6 +154,9 @@ def help_q : Flag<["/?", "-?"], "">, Alias<help>;
 // LLD extensions
 def exclude_all_symbols : F<"exclude-all-symbols">;
 def export_all_symbols : F<"export-all-symbols">;
+defm demangle : B<"demangle",
+    "Demangle symbols in output (default)",
+    "Do not demangle symbols in output">;
 def kill_at : F<"kill-at">;
 def lldmingw : F<"lldmingw">;
 def output_def : Joined<["/", "-"], "output-def:">;
@@ -171,17 +174,13 @@ defm threads: B<"threads",
 def lldmap : F<"lldmap">;
 def lldmap_file : Joined<["/", "-"], "lldmap:">;
 def show_timing : F<"time">;
+def summary : F<"summary">;
 
 //==============================================================================
 // The flags below do nothing. They are defined only for link.exe compatibility.
 //==============================================================================
 
 class QF<string name> : Joined<["/", "-", "-?"], name#":">;
-
-multiclass QB<string name> {
-  def "" : F<name>;
-  def _no : F<name#":no">;
-}
 
 def ignoreidl : F<"ignoreidl">;
 def nologo : F<"nologo">;

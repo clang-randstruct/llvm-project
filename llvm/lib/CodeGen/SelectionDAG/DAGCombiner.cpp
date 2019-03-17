@@ -384,6 +384,7 @@ namespace {
     SDValue replaceStoreOfFPConstant(StoreSDNode *ST);
 
     SDValue visitSTORE(SDNode *N);
+    SDValue visitLIFETIME_END(SDNode *N);
     SDValue visitINSERT_VECTOR_ELT(SDNode *N);
     SDValue visitEXTRACT_VECTOR_ELT(SDNode *N);
     SDValue visitBUILD_VECTOR(SDNode *N);
@@ -1591,6 +1592,7 @@ SDValue DAGCombiner::visit(SDNode *N) {
   case ISD::MLOAD:              return visitMLOAD(N);
   case ISD::MSCATTER:           return visitMSCATTER(N);
   case ISD::MSTORE:             return visitMSTORE(N);
+  case ISD::LIFETIME_END:       return visitLIFETIME_END(N);
   case ISD::FP_TO_FP16:         return visitFP_TO_FP16(N);
   case ISD::FP16_TO_FP:         return visitFP16_TO_FP(N);
   case ISD::VECREDUCE_FADD:
@@ -1706,6 +1708,12 @@ SDValue DAGCombiner::visitTokenFactor(SDNode *N) {
   // Don't simplify token factors if optnone.
   if (OptLevel == CodeGenOpt::None)
     return SDValue();
+
+  // If the sole user is a token factor, we should make sure we have a
+  // chance to merge them together. This prevents TF chains from inhibiting
+  // optimizations.
+  if (N->hasOneUse() && N->use_begin()->getOpcode() == ISD::TokenFactor)
+    AddToWorklist(*(N->use_begin()));
 
   SmallVector<SDNode *, 8> TFs;     // List of token factors to visit.
   SmallVector<SDValue, 8> Ops;      // Ops for replacing token factor.
@@ -5271,6 +5279,23 @@ SDValue DAGCombiner::visitORLike(SDValue N0, SDValue N1, SDNode *N) {
   return SDValue();
 }
 
+/// OR combines for which the commuted variant will be tried as well.
+static SDValue visitORCommutative(
+    SelectionDAG &DAG, SDValue N0, SDValue N1, SDNode *N) {
+  EVT VT = N0.getValueType();
+  if (N0.getOpcode() == ISD::AND) {
+    // fold (or (and X, (xor Y, -1)), Y) -> (or X, Y)
+    if (isBitwiseNot(N0.getOperand(1)) && N0.getOperand(1).getOperand(0) == N1)
+      return DAG.getNode(ISD::OR, SDLoc(N), VT, N0.getOperand(0), N1);
+
+    // fold (or (and (xor Y, -1), X), Y) -> (or X, Y)
+    if (isBitwiseNot(N0.getOperand(0)) && N0.getOperand(0).getOperand(0) == N1)
+      return DAG.getNode(ISD::OR, SDLoc(N), VT, N0.getOperand(1), N1);
+  }
+
+  return SDValue();
+}
+
 SDValue DAGCombiner::visitOR(SDNode *N) {
   SDValue N0 = N->getOperand(0);
   SDValue N1 = N->getOperand(1);
@@ -5417,6 +5442,11 @@ SDValue DAGCombiner::visitOR(SDNode *N) {
       return DAG.getNode(ISD::AND, SDLoc(N), VT, COR, IOR);
     }
   }
+
+  if (SDValue Combined = visitORCommutative(DAG, N0, N1, N))
+    return Combined;
+  if (SDValue Combined = visitORCommutative(DAG, N1, N0, N))
+    return Combined;
 
   // Simplify: (or (op x...), (op y...))  -> (op (or x, y))
   if (N0.getOpcode() == N1.getOpcode())
@@ -15420,23 +15450,22 @@ SDValue DAGCombiner::visitSTORE(SDNode *N) {
       Value.getValueType().isInteger() &&
       (!isa<ConstantSDNode>(Value) ||
        !cast<ConstantSDNode>(Value)->isOpaque())) {
+    APInt TruncDemandedBits =
+        APInt::getLowBitsSet(Value.getScalarValueSizeInBits(),
+                             ST->getMemoryVT().getScalarSizeInBits());
+
     // See if we can simplify the input to this truncstore with knowledge that
     // only the low bits are being used.  For example:
     // "truncstore (or (shl x, 8), y), i8"  -> "truncstore y, i8"
-    SDValue Shorter = DAG.GetDemandedBits(
-        Value, APInt::getLowBitsSet(Value.getScalarValueSizeInBits(),
-                                    ST->getMemoryVT().getScalarSizeInBits()));
+    SDValue Shorter = DAG.GetDemandedBits(Value, TruncDemandedBits);
     AddToWorklist(Value.getNode());
-    if (Shorter.getNode())
-      return DAG.getTruncStore(Chain, SDLoc(N), Shorter,
-                               Ptr, ST->getMemoryVT(), ST->getMemOperand());
+    if (Shorter)
+      return DAG.getTruncStore(Chain, SDLoc(N), Shorter, Ptr, ST->getMemoryVT(),
+                               ST->getMemOperand());
 
     // Otherwise, see if we can simplify the operation with
     // SimplifyDemandedBits, which only works if the value has a single use.
-    if (SimplifyDemandedBits(
-            Value,
-            APInt::getLowBitsSet(Value.getScalarValueSizeInBits(),
-                                 ST->getMemoryVT().getScalarSizeInBits()))) {
+    if (SimplifyDemandedBits(Value, TruncDemandedBits)) {
       // Re-visit the store if anything changed and the store hasn't been merged
       // with another node (N is deleted) SimplifyDemandedBits will add Value's
       // node back to the worklist if necessary, but we also need to re-visit
@@ -15560,6 +15589,66 @@ SDValue DAGCombiner::visitSTORE(SDNode *N) {
     return NewSt;
 
   return ReduceLoadOpStoreWidth(N);
+}
+
+SDValue DAGCombiner::visitLIFETIME_END(SDNode *N) {
+  const auto *LifetimeEnd = cast<LifetimeSDNode>(N);
+  if (!LifetimeEnd->hasOffset())
+    return SDValue();
+
+  const BaseIndexOffset LifetimeEndBase(N->getOperand(1), SDValue(),
+                                        LifetimeEnd->getOffset(), false);
+
+  // We walk up the chains to find stores.
+  SmallVector<SDValue, 8> Chains = {N->getOperand(0)};
+  while (!Chains.empty()) {
+    SDValue Chain = Chains.back();
+    Chains.pop_back();
+    if (!Chain.hasOneUse())
+      continue;
+    switch (Chain.getOpcode()) {
+    case ISD::TokenFactor:
+      for (unsigned Nops = Chain.getNumOperands(); Nops;)
+        Chains.push_back(Chain.getOperand(--Nops));
+      break;
+    case ISD::LIFETIME_START:
+    case ISD::LIFETIME_END: {
+      // We can forward past any lifetime start/end that can be proven not to
+      // alias the node.
+      const auto *Lifetime = cast<LifetimeSDNode>(Chain);
+      if (!Lifetime->hasOffset())
+        break; // Be conservative if we don't know the extents of the object.
+
+      const BaseIndexOffset LifetimeBase(Lifetime->getOperand(1), SDValue(),
+                                         Lifetime->getOffset(), false);
+      bool IsAlias;
+      if (BaseIndexOffset::computeAliasing(LifetimeEndBase,
+                                           LifetimeEnd->getSize(), LifetimeBase,
+                                           Lifetime->getSize(), DAG, IsAlias) &&
+          !IsAlias) {
+        Chains.push_back(Chain.getOperand(0));
+      }
+      break;
+    }
+    case ISD::STORE: {
+      StoreSDNode *ST = dyn_cast<StoreSDNode>(Chain);
+      if (ST->isVolatile() || ST->isIndexed())
+        continue;
+      const BaseIndexOffset StoreBase = BaseIndexOffset::match(ST, DAG);
+      // If we store purely within object bounds just before its lifetime ends,
+      // we can remove the store.
+      if (LifetimeEndBase.contains(DAG, LifetimeEnd->getSize() * 8, StoreBase,
+                                   ST->getMemoryVT().getStoreSizeInBits())) {
+        LLVM_DEBUG(dbgs() << "\nRemoving store:"; StoreBase.dump();
+                   dbgs() << "\nwithin LIFETIME_END of : ";
+                   LifetimeEndBase.dump(); dbgs() << "\n");
+        CombineTo(ST, ST->getChain());
+        return SDValue(N, 0);
+      }
+    }
+    }
+  }
+  return SDValue();
 }
 
 /// For the instruction sequence of store below, F and I values
@@ -17529,8 +17618,8 @@ static SDValue combineShuffleOfScalars(ShuffleVectorSDNode *SVN,
       if (S.getOpcode() == ISD::BUILD_VECTOR) {
         Op = S.getOperand(Idx);
       } else if (S.getOpcode() == ISD::SCALAR_TO_VECTOR) {
-        assert(Idx == 0 && "Unexpected SCALAR_TO_VECTOR operand index.");
-        Op = S.getOperand(0);
+        SDValue Op0 = S.getOperand(0);
+        Op = Idx == 0 ? Op0 : DAG.getUNDEF(Op0.getValueType());
       } else {
         // Operand can't be combined - bail out.
         return SDValue();
@@ -19395,6 +19484,8 @@ void DAGCombiner::GatherAllAliases(LSBaseSDNode *N, SDValue OriginalChain,
 
   // Get alias information for node.
   bool IsLoad = isa<LoadSDNode>(N) && !N->isVolatile();
+  const BaseIndexOffset LSBasePtr = BaseIndexOffset::match(N, DAG);
+  const unsigned LSNumBytes = N->getMemoryVT().getStoreSize();
 
   // Starting off.
   Chains.push_back(OriginalChain);
@@ -19464,6 +19555,31 @@ void DAGCombiner::GatherAllAliases(LSBaseSDNode *N, SDValue OriginalChain,
       Chains.push_back(Chain.getOperand(0));
       ++Depth;
       break;
+
+    case ISD::LIFETIME_START:
+    case ISD::LIFETIME_END: {
+      // We can forward past any lifetime start/end that can be proven not to
+      // alias the memory access.
+      const auto *Lifetime = cast<LifetimeSDNode>(Chain);
+      if (!Lifetime->hasOffset()) {
+        Aliases.push_back(Chain);
+        break; // Be conservative if we don't know the extents of the object.
+      }
+
+      const BaseIndexOffset LifetimePtr(Lifetime->getOperand(1), SDValue(),
+                                        Lifetime->getOffset(), false);
+      bool IsAlias;
+      if (BaseIndexOffset::computeAliasing(LifetimePtr, Lifetime->getSize(),
+                                           LSBasePtr, LSNumBytes, DAG,
+                                           IsAlias) &&
+          !IsAlias) {
+        Chains.push_back(Chain.getOperand(0));
+        ++Depth;
+      } else {
+        Aliases.push_back(Chain);
+      }
+      break;
+    }
 
     default:
       // For all other instructions we will just have to take what we can get.

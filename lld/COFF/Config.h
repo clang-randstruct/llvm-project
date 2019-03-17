@@ -90,6 +90,7 @@ struct Configuration {
   bool NoEntry = false;
   std::string OutputFile;
   std::string ImportName;
+  bool Demangle = true;
   bool DoGC = true;
   bool DoICF = true;
   bool TailMerge;
@@ -101,6 +102,7 @@ struct Configuration {
   bool DebugGHashes = false;
   bool DebugSymtab = false;
   bool ShowTiming = false;
+  bool ShowSummary = false;
   unsigned DebugTypes = static_cast<unsigned>(DebugType::None);
   std::vector<std::string> NatvisFiles;
   llvm::SmallString<128> PDBAltPath;

@@ -640,7 +640,8 @@ public:
   /// \pre setBasicBlock or setMI must have been called.
   ///
   /// \return a MachineInstrBuilder for the newly created instruction.
-  MachineInstrBuilder buildCopy(const DstOp &Res, const SrcOp &Op);
+  MachineInstrBuilder buildCopy(const DstOp &Res, const SrcOp &Op,
+                                unsigned Subreg = 0);
 
   /// Build and insert `Res = G_LOAD Addr, MMO`.
   ///
@@ -791,7 +792,7 @@ public:
   /// \pre setBasicBlock or setMI must have been called.
   ///
   /// \return a MachineInstrBuilder for the newly created instruction.
-  MachineInstrBuilder buildIntrinsic(Intrinsic::ID ID, unsigned Res,
+  MachineInstrBuilder buildIntrinsic(Intrinsic::ID ID, ArrayRef<unsigned> Res,
                                      bool HasSideEffects);
 
   /// Build and insert \p Res = G_FPTRUNC \p Op
