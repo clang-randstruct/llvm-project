@@ -1267,8 +1267,12 @@ static bool combineToUAddWithOverflow(CmpInst *Cmp, const TargetLowering &TLI,
 static bool combineToUSubWithOverflow(CmpInst *Cmp, const TargetLowering &TLI,
                                       const DataLayout &DL, DominatorTree &DT,
                                       bool &ModifiedDT) {
-  // Convert (A u> B) to (A u< B) to simplify pattern matching.
+  // We are not expecting non-canonical/degenerate code. Just bail out.
   Value *A = Cmp->getOperand(0), *B = Cmp->getOperand(1);
+  if (isa<Constant>(A) && isa<Constant>(B))
+    return false;
+
+  // Convert (A u> B) to (A u< B) to simplify pattern matching.
   ICmpInst::Predicate Pred = Cmp->getPredicate();
   if (Pred == ICmpInst::ICMP_UGT) {
     std::swap(A, B);
@@ -2073,6 +2077,7 @@ struct ExtAddrMode : public TargetLowering::AddrMode {
   Value *BaseReg = nullptr;
   Value *ScaledReg = nullptr;
   Value *OriginalValue = nullptr;
+  bool InBounds = true;
 
   enum FieldName {
     NoField        = 0x00,
@@ -2083,6 +2088,7 @@ struct ExtAddrMode : public TargetLowering::AddrMode {
     ScaleField     = 0x10,
     MultipleFields = 0xff
   };
+
 
   ExtAddrMode() = default;
 
@@ -2100,6 +2106,10 @@ struct ExtAddrMode : public TargetLowering::AddrMode {
       return MultipleFields;
     if (ScaledReg && other.ScaledReg &&
         ScaledReg->getType() != other.ScaledReg->getType())
+      return MultipleFields;
+
+    // Conservatively reject 'inbounds' mismatches.
+    if (InBounds != other.InBounds)
       return MultipleFields;
 
     // Check each field to see if it differs.
@@ -2200,6 +2210,8 @@ static inline raw_ostream &operator<<(raw_ostream &OS, const ExtAddrMode &AM) {
 void ExtAddrMode::print(raw_ostream &OS) const {
   bool NeedPlus = false;
   OS << "[";
+  if (InBounds)
+    OS << "inbounds ";
   if (BaseGV) {
     OS << (NeedPlus ? " + " : "")
        << "GV:";
@@ -3270,6 +3282,8 @@ private:
                     PhiNodeSet &PhiNodesToMatch) {
     SmallVector<PHIPair, 8> WorkList;
     Matcher.insert({ PHI, Candidate });
+    SmallSet<PHINode *, 8> MatchedPHIs;
+    MatchedPHIs.insert(PHI);
     WorkList.push_back({ PHI, Candidate });
     SmallSet<PHIPair, 8> Visited;
     while (!WorkList.empty()) {
@@ -3302,8 +3316,10 @@ private:
         if (Matcher.count({ FirstPhi, SecondPhi }))
           continue;
         // So the values are different and does not match. So we need them to
-        // match.
-        Matcher.insert({ FirstPhi, SecondPhi });
+        // match. (But we register no more than one match per PHI node, so that
+        // we won't later try to replace them twice.)
+        if (!MatchedPHIs.insert(FirstPhi).second)
+          Matcher.insert({ FirstPhi, SecondPhi });
         // But me must check it.
         WorkList.push_back({ FirstPhi, SecondPhi });
       }
@@ -3498,6 +3514,7 @@ bool AddressingModeMatcher::matchScaledValue(Value *ScaleReg, int64_t Scale,
   ConstantInt *CI = nullptr; Value *AddLHS = nullptr;
   if (isa<Instruction>(ScaleReg) &&  // not a constant expr.
       match(ScaleReg, m_Add(m_Value(AddLHS), m_ConstantInt(CI)))) {
+    TestAddrMode.InBounds = false;
     TestAddrMode.ScaledReg = AddLHS;
     TestAddrMode.BaseOffs += CI->getSExtValue()*TestAddrMode.Scale;
 
@@ -4072,6 +4089,7 @@ bool AddressingModeMatcher::matchOperationAddr(User *AddrInst, unsigned Opcode,
     TypePromotionTransaction::ConstRestorationPt LastKnownGood =
         TPT.getRestorationPoint();
 
+    AddrMode.InBounds = false;
     if (matchAddr(AddrInst->getOperand(1), Depth+1) &&
         matchAddr(AddrInst->getOperand(0), Depth+1))
       return true;
@@ -4098,6 +4116,7 @@ bool AddressingModeMatcher::matchOperationAddr(User *AddrInst, unsigned Opcode,
   case Instruction::Mul:
   case Instruction::Shl: {
     // Can only handle X*C and X << C.
+    AddrMode.InBounds = false;
     ConstantInt *RHS = dyn_cast<ConstantInt>(AddrInst->getOperand(1));
     if (!RHS || RHS->getBitWidth() > 64)
       return false;
@@ -4149,8 +4168,11 @@ bool AddressingModeMatcher::matchOperationAddr(User *AddrInst, unsigned Opcode,
       if (ConstantOffset == 0 ||
           TLI.isLegalAddressingMode(DL, AddrMode, AccessTy, AddrSpace)) {
         // Check to see if we can fold the base pointer in too.
-        if (matchAddr(AddrInst->getOperand(0), Depth+1))
+        if (matchAddr(AddrInst->getOperand(0), Depth+1)) {
+          if (!cast<GEPOperator>(AddrInst)->isInBounds())
+            AddrMode.InBounds = false;
           return true;
+        }
       } else if (EnableGEPOffsetSplit && isa<GetElementPtrInst>(AddrInst) &&
                  TLI.shouldConsiderGEPOffsetSplit() && Depth == 0 &&
                  ConstantOffset > 0) {
@@ -4186,6 +4208,8 @@ bool AddressingModeMatcher::matchOperationAddr(User *AddrInst, unsigned Opcode,
 
     // See if the scale and offset amount is valid for this target.
     AddrMode.BaseOffs += ConstantOffset;
+    if (!cast<GEPOperator>(AddrInst)->isInBounds())
+      AddrMode.InBounds = false;
 
     // Match the base operand of the GEP.
     if (!matchAddr(AddrInst->getOperand(0), Depth+1)) {
@@ -4871,7 +4895,11 @@ bool CodeGenPrepare::optimizeMemoryInst(Instruction *MemoryInst, Value *Addr,
           // SDAG consecutive load/store merging.
           if (ResultPtr->getType() != I8PtrTy)
             ResultPtr = Builder.CreatePointerCast(ResultPtr, I8PtrTy);
-          ResultPtr = Builder.CreateGEP(I8Ty, ResultPtr, ResultIndex, "sunkaddr");
+          ResultPtr =
+              AddrMode.InBounds
+                  ? Builder.CreateInBoundsGEP(I8Ty, ResultPtr, ResultIndex,
+                                              "sunkaddr")
+                  : Builder.CreateGEP(I8Ty, ResultPtr, ResultIndex, "sunkaddr");
         }
 
         ResultIndex = V;
@@ -4882,7 +4910,11 @@ bool CodeGenPrepare::optimizeMemoryInst(Instruction *MemoryInst, Value *Addr,
       } else {
         if (ResultPtr->getType() != I8PtrTy)
           ResultPtr = Builder.CreatePointerCast(ResultPtr, I8PtrTy);
-        SunkAddr = Builder.CreateGEP(I8Ty, ResultPtr, ResultIndex, "sunkaddr");
+        SunkAddr =
+            AddrMode.InBounds
+                ? Builder.CreateInBoundsGEP(I8Ty, ResultPtr, ResultIndex,
+                                            "sunkaddr")
+                : Builder.CreateGEP(I8Ty, ResultPtr, ResultIndex, "sunkaddr");
       }
 
       if (SunkAddr->getType() != Addr->getType())
@@ -6849,6 +6881,7 @@ bool CodeGenPrepare::optimizeInst(Instruction *I, DominatorTree &DT,
     // to introduce PHI nodes too late to be cleaned up.  If we detect such a
     // trivial PHI, go ahead and zap it here.
     if (Value *V = SimplifyInstruction(P, {*DL, TLInfo})) {
+      LargeOffsetGEPMap.erase(P);
       P->replaceAllUsesWith(V);
       P->eraseFromParent();
       ++NumPHIsElim;

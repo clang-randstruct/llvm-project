@@ -229,7 +229,7 @@ static bool isCompressable(const SectionBase &Section) {
 }
 
 static void replaceDebugSections(
-    const CopyConfig &Config, Object &Obj, SectionPred &RemovePred,
+    Object &Obj, SectionPred &RemovePred,
     function_ref<bool(const SectionBase &)> shouldReplace,
     function_ref<SectionBase *(const SectionBase *)> addSection) {
   // Build a list of the debug sections we are going to replace.
@@ -403,7 +403,7 @@ static Error handleArgs(const CopyConfig &Config, Object &Obj,
 
   if (Config.StripSections) {
     RemovePred = [RemovePred](const SectionBase &Sec) {
-      return RemovePred(Sec) || (Sec.Flags & SHF_ALLOC) == 0;
+      return RemovePred(Sec) || Sec.ParentSegment == nullptr;
     };
   }
 
@@ -419,7 +419,7 @@ static Error handleArgs(const CopyConfig &Config, Object &Obj,
         return true;
       if (&Sec == Obj.SectionNames)
         return false;
-      return (Sec.Flags & SHF_ALLOC) == 0;
+      return (Sec.Flags & SHF_ALLOC) == 0 && Sec.ParentSegment == nullptr;
     };
 
   if (Config.StripAll)
@@ -429,6 +429,8 @@ static Error handleArgs(const CopyConfig &Config, Object &Obj,
       if (&Sec == Obj.SectionNames)
         return false;
       if (StringRef(Sec.Name).startswith(".gnu.warning"))
+        return false;
+      if (Sec.ParentSegment != nullptr)
         return false;
       return (Sec.Flags & SHF_ALLOC) == 0;
     };
@@ -481,14 +483,14 @@ static Error handleArgs(const CopyConfig &Config, Object &Obj,
   }
 
   if (Config.CompressionType != DebugCompressionType::None)
-    replaceDebugSections(Config, Obj, RemovePred, isCompressable,
+    replaceDebugSections(Obj, RemovePred, isCompressable,
                          [&Config, &Obj](const SectionBase *S) {
                            return &Obj.addSection<CompressedSection>(
                                *S, Config.CompressionType);
                          });
   else if (Config.DecompressDebugSections)
     replaceDebugSections(
-        Config, Obj, RemovePred,
+        Obj, RemovePred,
         [](const SectionBase &S) { return isa<CompressedSection>(&S); },
         [&Obj](const SectionBase *S) {
           auto CS = cast<CompressedSection>(S);
@@ -520,35 +522,31 @@ static Error handleArgs(const CopyConfig &Config, Object &Obj,
       }
     }
   }
-
-  if (!Config.AddSection.empty()) {
-    for (const auto &Flag : Config.AddSection) {
-      std::pair<StringRef, StringRef> SecPair = Flag.split("=");
-      StringRef SecName = SecPair.first;
-      StringRef File = SecPair.second;
-      ErrorOr<std::unique_ptr<MemoryBuffer>> BufOrErr =
-          MemoryBuffer::getFile(File);
-      if (!BufOrErr)
-        return createFileError(File, errorCodeToError(BufOrErr.getError()));
-      std::unique_ptr<MemoryBuffer> Buf = std::move(*BufOrErr);
-      ArrayRef<uint8_t> Data(
-          reinterpret_cast<const uint8_t *>(Buf->getBufferStart()),
-          Buf->getBufferSize());
-      OwnedDataSection &NewSection =
-          Obj.addSection<OwnedDataSection>(SecName, Data);
-      if (SecName.startswith(".note") && SecName != ".note.GNU-stack")
-        NewSection.Type = SHT_NOTE;
-    }
+  
+  for (const auto &Flag : Config.AddSection) {
+    std::pair<StringRef, StringRef> SecPair = Flag.split("=");
+    StringRef SecName = SecPair.first;
+    StringRef File = SecPair.second;
+    ErrorOr<std::unique_ptr<MemoryBuffer>> BufOrErr =
+        MemoryBuffer::getFile(File);
+    if (!BufOrErr)
+      return createFileError(File, errorCodeToError(BufOrErr.getError()));
+    std::unique_ptr<MemoryBuffer> Buf = std::move(*BufOrErr);
+    ArrayRef<uint8_t> Data(
+        reinterpret_cast<const uint8_t *>(Buf->getBufferStart()),
+        Buf->getBufferSize());
+    OwnedDataSection &NewSection =
+        Obj.addSection<OwnedDataSection>(SecName, Data);
+    if (SecName.startswith(".note") && SecName != ".note.GNU-stack")
+      NewSection.Type = SHT_NOTE;
   }
 
-  if (!Config.DumpSection.empty()) {
-    for (const auto &Flag : Config.DumpSection) {
-      std::pair<StringRef, StringRef> SecPair = Flag.split("=");
-      StringRef SecName = SecPair.first;
-      StringRef File = SecPair.second;
-      if (Error E = dumpSectionToFile(SecName, File, Obj))
-        return createFileError(Config.InputFilename, std::move(E));
-    }
+  for (const auto &Flag : Config.DumpSection) {
+    std::pair<StringRef, StringRef> SecPair = Flag.split("=");
+    StringRef SecName = SecPair.first;
+    StringRef File = SecPair.second;
+    if (Error E = dumpSectionToFile(SecName, File, Obj))
+      return createFileError(Config.InputFilename, std::move(E));
   }
 
   if (!Config.AddGnuDebugLink.empty())
